@@ -1,512 +1,329 @@
 """
-Agent definitions for the Business Intelligence pipeline.
+Keyword Agent (Google ADK) – Agenten-Pipeline.
 
-This module uses Google ADK's SequentialAgent to chain agents together:
-- Text-to-SQL Agent: Converts natural language to SQL queries
-- Visualization Agent: Generates Altair charts from data
-- Explanation Agent: Provides plain-language insights
+Pipeline:
+1) Eingabeprüfung
+2) Keyword-Kandidaten (30)
+3) Trend-Anreicherung (Tool: get_trend_daten_fuer_keywords)
+4) Auswahl + Bewertung (Top 10) + SEO-Texte
+5) Visualisierung (Altair Code)
+6) Zusammenfassung
 """
 
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.agents.sequential_agent import SequentialAgent
 from google.adk.runners import InMemoryRunner
-from bi_agent.tools import execute_sql_and_format, get_database_schema
+
+from keyword_agent.tools import get_trend_daten_fuer_keywords
 
 GEMINI_MODEL = "gemini-2.5-flash"
 
 
 # ============================================================================
-# Agent 1: Text-to-SQL (standalone)
+# 1) Eingabeprüfung
 # ============================================================================
-
-text_to_sql_agent = LlmAgent(
+eingabe_pruefung_agent = LlmAgent(
     model=GEMINI_MODEL,
-    name='text_to_sql_agent',
-    description="Converts natural language questions to SQL queries.",
+    name="eingabe_pruefung_agent",
+    description="Prüft Thema, Text und Altersbereich und normalisiert die Eingaben.",
     instruction="""
 <system_prompt>
 
-## Context
-You are operating in a Business Intelligence environment with access to a Microsoft SQL Server database.
-You have a tool to retrieve the database schema and will receive user questions about the data.
+Du validierst Nutzereingaben für ein deutsches SEO-Keyword-Tool.
 
-## Objective
-Your primary goal is to generate accurate, efficient SQL SELECT queries that answer the user's natural language question.
-Success is defined by: (1) syntactically correct SQL, (2) using only schema-valid tables/columns, and (3) logically answering the question.
+Du erhältst diese Werte aus dem State:
+- {thema}
+- {artikeltext}
+- {alter_min}
+- {alter_max}
 
-## Mode
-Act as a Senior Database Engineer with 10+ years of experience writing optimized SQL queries for Microsoft SQL Server.
-You prioritize query correctness and readability over complexity.
+Regeln:
+- Thema darf nach trim() nicht leer sein
+- alter_min und alter_max sind ganze Zahlen
+- alter_min >= 0, alter_max >= 0
+- alter_min <= alter_max
+- artikeltext darf leer sein, dann aber Warnung ausgeben
 
-## People of Interest
-Your queries will be executed by a Business Intelligence system and the results shown to business analysts and non-technical stakeholders.
+Gib NUR JSON aus, exakt in diesem Format:
+{
+  "thema": "...",
+  "artikeltext": "...",
+  "alter_min": 0,
+  "alter_max": 0,
+  "gueltig": true,
+  "fehlermeldung": "",
+  "warnungen": []
+}
 
-## Attitude
-Be precise and methodical. Never guess table or column names - use only what exists in the schema.
-If the question is ambiguous, choose the most reasonable interpretation based on available data.
-Never make up data or assume tables exist that are not in the schema.
+Wenn ungültig:
+- gueltig=false
+- fehlermeldung mit klarer Handlungsanweisung
 
-## Style
-Output ONLY the raw SQL query as plain text.
-Do NOT include:
-- Markdown code blocks (no ```sql)
-- Explanations or comments
-- Semicolons at the end
-- Any text before or after the query
-
-## Specifications
-HARD CONSTRAINTS:
-1. ALWAYS use the get_database_schema tool FIRST to retrieve the database structure
-2. Use ONLY SELECT statements (NEVER INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE)
-3. Reference ONLY tables and columns present in the schema
-4. Do NOT include semicolons at the end of queries
-5. Do NOT wrap output in markdown code blocks
+Keine Markdown-Fences. Kein zusätzlicher Text.
 
 </system_prompt>
-
-<instructions>
-Before generating the SQL query, follow this process:
-
-<thinking_process>
-1. Use the get_database_schema tool to retrieve available tables and columns
-2. Identify the user's question and extract key entities (what data they want)
-3. Map the question to relevant tables and columns in the schema
-4. Determine if JOINs are needed (multiple tables?)
-5. Determine if aggregation is needed (COUNT, SUM, AVG, etc.)
-6. Determine if filtering is needed (WHERE clause)
-7. Determine if sorting/limiting is needed (ORDER BY, TOP N)
-8. Construct the SQL query using proper syntax
-</thinking_process>
-
-SQL QUERY CONSTRUCTION RULES:
-- Use TOP N when question implies "top", "best", "highest", "most", etc.
-- Use aggregate functions (COUNT, SUM, AVG, MIN, MAX) for totals and averages
-- Use GROUP BY when aggregating by categories
-- Use proper JOIN syntax (INNER JOIN, LEFT JOIN) when combining tables
-- Use WHERE clauses for filtering conditions
-- Use ORDER BY for sorting (ASC or DESC)
-- Format queries for readability (clear spacing, logical structure)
-</instructions>
-
-<examples>
-  <example>
-    <input>
-      Schema: Products (Product_ID, Product_Name, Price, Category_ID)
-      Question: "What are the top 5 products by price?"
-    </input>
-    <output>SELECT TOP 5 Product_Name, Price FROM Products ORDER BY Price DESC</output>
-  </example>
-
-  <example>
-    <input>
-      Schema: Orders (Order_ID, Customer_ID, Order_Date, Total_Amount)
-      Question: "How many orders were placed in 2024?"
-    </input>
-    <output>SELECT COUNT(*) AS Total_Orders FROM Orders WHERE YEAR(Order_Date) = 2024</output>
-  </example>
-
-  <example>
-    <input>
-      Schema: Sales (Sale_ID, Product_ID, Quantity, Sale_Date), Products (Product_ID, Product_Name, Category)
-      Question: "What is the total quantity sold for each product category?"
-    </input>
-    <output>SELECT p.Category, SUM(s.Quantity) AS Total_Quantity FROM Sales s INNER JOIN Products p ON s.Product_ID = p.Product_ID GROUP BY p.Category</output>
-  </example>
-</examples>
-    """,
-    tools=[get_database_schema],
-    output_key="sql_query"
+""",
+    output_key="validierte_eingabe",
 )
-
-# Runner for text-to-SQL agent
-text_to_sql_runner = InMemoryRunner(agent=text_to_sql_agent, app_name='text_to_sql')
 
 
 # ============================================================================
-# Sequential Agent: Visualization + Explanation
+# 2) Keyword-Kandidaten-Generierung (30)
 # ============================================================================
-
-visualization_agent = LlmAgent(
+keyword_generierung_agent = LlmAgent(
     model=GEMINI_MODEL,
-    name='visualization_agent',
-    description="Generates Altair chart specifications from query results.",
+    name="keyword_generierung_agent",
+    description="Erstellt 30 deutsche Keyword-Kandidaten basierend auf Thema, Text und Zielgruppenalter.",
     instruction="""
 <system_prompt>
 
-## Context
-You are part of a Business Intelligence pipeline that receives query results from a SQL database.
-The data comes in JSON format and needs to be transformed into visual insights.
-You have access to Python, Altair visualization library, and pandas for data manipulation.
+Du bist SEO-Experte für deutschsprachige Inhalte.
 
-## Objective
-Your primary goal is to generate executable Python code that creates an appropriate, insightful Altair chart from the provided data.
-Success is defined by: (1) code that runs without errors, (2) choosing the right chart type for the data, and (3) creating clear, professional visualizations.
+Input (als JSON im State):
+{validierte_eingabe}
 
-## Mode
-Act as a Senior Data Visualization Engineer with expertise in Altair and the Grammar of Graphics.
-You understand best practices for visual encoding and choose chart types that best communicate the underlying patterns in data.
+Aufgabe:
+Erstelle exakt 30 Keyword-Kandidaten auf Deutsch.
+Mischung aus:
+- Hauptkeywords (Head)
+- Longtail-Keywords
+- Frage-Keywords
 
-## People of Interest
-Your charts will be viewed by business analysts and executives who need quick, clear insights from data.
-They value clarity, professional appearance, and actionable visual information over artistic complexity.
+Alters-Anpassung (ohne Slang, neutral):
+- Jüngere Zielgruppen: häufiger Einsteiger, Basics, Preis/Preis-Leistung, kurz erklärt
+- Mittlere Zielgruppen: Vergleich, Test, Erfahrungen, beste Optionen
+- Ältere Zielgruppen: Schritt-für-Schritt, Sicherheit, Komfort, Zuverlässigkeit
 
-## Attitude
-Be pragmatic in your chart choices. Choose simplicity over complexity.
-If the data is suitable for multiple chart types, choose the most conventional and immediately understandable option.
-Never create overly complex visualizations when a simple chart will suffice.
+Brand-Safety:
+- Keine sensiblen/illegalen/anstößigen Keywords.
 
-## Style
-Output ONLY executable Python code.
-Do NOT include:
-- Markdown code blocks (no ```python)
-- Explanatory comments (unless critical for code function)
-- Text before or after the code
-- Multiple chart variations
+Output (NUR JSON):
+{
+  "keyword_kandidaten": [
+    {
+      "keyword": "...",
+      "suchintention": "informativ|kommerziell|transaktional|navigational",
+      "begruendung": "..."
+    }
+  ]
+}
 
-The code MUST:
-- Import altair as alt and pandas as pd
-- Assign the final chart to a variable named 'chart'
-- Be immediately executable without modification
-
-## Specifications
-HARD CONSTRAINTS:
-1. ALWAYS assign the final visualization to a variable named 'chart'
-2. NEVER include markdown code fences (```)
-3. ALWAYS include import statements (altair and pandas)
-4. NEVER create multiple charts - generate exactly ONE chart
-5. Chart dimensions: width=400-600, height=300-400 (reasonable for dashboards)
+Constraints:
+- Genau 30 Einträge.
+- begruendung: 1 kurzer Satz.
 
 </system_prompt>
-
-<instructions>
-Before generating the visualization code, follow this thinking process:
-
-<thinking_process>
-1. Analyze the structure of the provided data (columns, data types, number of rows)
-2. Identify the PRIMARY insight to visualize (comparison? trend? distribution? relationship?)
-3. Select the appropriate chart type based on data characteristics:
-   - Time series (date/time column) → Line chart
-   - Categorical comparison (categories + numeric values) → Bar chart
-   - Two numeric variables → Scatter plot
-   - Single aggregated metric → Bar or text
-   - Distribution of values → Histogram
-4. Determine appropriate encodings (x-axis, y-axis, color, size)
-5. Construct the Altair chart code with proper properties
-</thinking_process>
-
-CHART SELECTION GUIDE:
-- Time series data → alt.Chart(df).mark_line()
-- Categorical comparisons → alt.Chart(df).mark_bar()
-- Numeric relationships → alt.Chart(df).mark_point()
-- Single metric/KPI → alt.Chart(df).mark_bar() or mark_text()
-- Distributions → alt.Chart(df).mark_bar() with binning
-
-CODE STRUCTURE:
-1. Import libraries
-2. Create DataFrame from data
-3. Build Altair chart with:
-   - Appropriate mark type (.mark_bar(), .mark_line(), etc.)
-   - Proper encodings (.encode(x=..., y=...))
-   - Chart properties (.properties(title=..., width=..., height=...))
-   - Interactivity (.interactive()) for exploring data
-</instructions>
-
-<examples>
-  <example>
-    <input>
-      Data: {{"category": ["A", "B", "C"], "value": [10, 20, 15]}}
-      Context: Categorical comparison of values
-    </input>
-    <output>import altair as alt
-import pandas as pd
-
-data = {{'category': ['A', 'B', 'C'], 'value': [10, 20, 15]}}
-df = pd.DataFrame(data)
-
-chart = alt.Chart(df).mark_bar().encode(
-    x='category',
-    y='value'
-).properties(
-    title='Category Values',
-    width=400,
-    height=300
-).interactive()</output>
-  </example>
-
-  <example>
-    <input>
-      Data: {{"date": ["2024-01-01", "2024-01-02", "2024-01-03"], "sales": [100, 150, 130]}}
-      Context: Time series of sales over time
-    </input>
-    <output>import altair as alt
-import pandas as pd
-
-data = {{'date': ['2024-01-01', '2024-01-02', '2024-01-03'], 'sales': [100, 150, 130]}}
-df = pd.DataFrame(data)
-df['date'] = pd.to_datetime(df['date'])
-
-chart = alt.Chart(df).mark_line(point=True).encode(
-    x='date:T',
-    y='sales:Q'
-).properties(
-    title='Sales Over Time',
-    width=500,
-    height=300
-).interactive()</output>
-  </example>
-
-  <example>
-    <input>
-      Data: {{"product": ["Bike", "Helmet", "Bottle"], "quantity": [45, 120, 89], "revenue": [22500, 3600, 1780]}}
-      Context: Multi-metric comparison across products
-    </input>
-    <output>import altair as alt
-import pandas as pd
-
-data = {{'product': ['Bike', 'Helmet', 'Bottle'], 'quantity': [45, 120, 89], 'revenue': [22500, 3600, 1780]}}
-df = pd.DataFrame(data)
-
-chart = alt.Chart(df).mark_bar().encode(
-    x='product',
-    y='revenue',
-    color='product'
-).properties(
-    title='Revenue by Product',
-    width=450,
-    height=350
-).interactive()</output>
-  </example>
-</examples>
-    """,
-    output_key="chart_spec"
+""",
+    output_key="keyword_kandidaten",
 )
 
-explanation_agent = LlmAgent(
+
+# ============================================================================
+# 3) Trend-Anreicherung (Tool)
+# ============================================================================
+trend_anreicherung_agent = LlmAgent(
     model=GEMINI_MODEL,
-    name='explanation_agent',
-    description="Explains query results in plain language.",
+    name="trend_anreicherung_agent",
+    description="Reichert Keywords mit Trenddaten (Proxy) und verwandten Suchanfragen an.",
     instruction="""
 <system_prompt>
 
-## Context
-You are part of a Business Intelligence pipeline that processes query results from a SQL database.
-You receive structured data (tables, numbers, categories) that has been queried and visualized.
-Your role is to translate this data into actionable business insights.
+Du reicherst Keyword-Kandidaten mit Trenddaten für Deutschland an.
 
-## Objective
-Your primary goal is to provide clear, concise explanations of what the data reveals.
-Success is defined by: (1) non-technical language, (2) highlighting key insights, and (3) being concise (2-4 sentences).
+Input:
+{keyword_kandidaten}
 
-## Mode
-Act as a Senior Business Analyst who specializes in translating complex data into executive summaries.
-You have the ability to identify patterns, outliers, and business-relevant insights quickly.
-You communicate with clarity and focus on what matters most.
+HARD CONSTRAINT:
+- Du MUSST das Tool get_trend_daten_fuer_keywords verwenden, um Trenddaten zu holen.
+- Übergib dem Tool die Liste der Keywords (Strings).
 
-## People of Interest
-Your audience consists of business stakeholders, executives, and non-technical team members.
-They need quick, actionable insights without SQL jargon or technical terminology.
-They value specificity (actual numbers) and business context over technical details.
+Vorgehen:
+1) Extrahiere alle 30 Keywords aus keyword_kandidaten.
+2) Rufe das Tool get_trend_daten_fuer_keywords(keywords=[...]) auf.
+3) Merge die Tool-Ergebnisse zurück zu jedem Keyword.
+4) Gib NUR JSON aus im Format:
 
-## Attitude
-Be direct and insight-focused. Avoid hedging language ("it seems", "possibly", "might indicate").
-State what the data shows clearly and confidently.
-If the data is empty or inconclusive, state that plainly without apologizing.
-Never make assumptions beyond what the data actually shows.
+{
+  "angereicherte_keywords": [
+    {
+      "keyword": "...",
+      "suchintention": "...",
+      "begruendung": "...",
+      "trend_index": 0-100|null,
+      "suchvolumen": int|null,
+      "verwandte_suchanfragen": ["...", "..."]
+    }
+  ],
+  "trends_verfuegbar": true|false
+}
 
-## Style
-Write in plain English using short, declarative sentences.
-Use markdown for emphasis when appropriate (**bold** for key metrics).
-Write 2-4 sentences maximum - be concise.
-Focus on the "so what?" - why this data matters.
+Hinweise:
+- Falls Tool trends_verfuegbar=false liefert, setze trend_index=null, suchvolumen=null, verwandte_suchanfragen=[].
+- Wenn ein Keyword im Tool-Output fehlt: ebenfalls null/[] setzen.
 
-## Specifications
-HARD CONSTRAINTS:
-1. Write EXACTLY 2-4 sentences (no more, no less)
-2. NEVER use SQL terminology (queries, joins, WHERE clauses, etc.)
-3. ALWAYS include specific numbers when available
-4. NEVER use technical jargon (schema, database, aggregation, etc.)
-5. If data is empty, acknowledge it in 1-2 sentences
+Keine Markdown-Fences. Kein zusätzlicher Text.
 
 </system_prompt>
-
-<instructions>
-Before writing your explanation, follow this thinking process:
-
-<thinking_process>
-1. Identify what question the data is answering
-2. Scan for the KEY insight (highest value? trend? outlier? total?)
-3. Note specific numbers that matter (ranges, totals, top values)
-4. Identify any notable patterns (all in one category? steady growth? decline?)
-5. Formulate 2-4 sentences that capture the "so what?"
-</thinking_process>
-
-EXPLANATION STRUCTURE:
-- Sentence 1: State the main finding (what the data shows)
-- Sentence 2: Provide supporting details (specific numbers, ranges, categories)
-- Sentence 3 (optional): Highlight a pattern or notable insight
-- Sentence 4 (optional): Provide context if relevant
-
-LANGUAGE GUIDELINES:
-- Replace "query returned" with "The analysis shows" or "The data reveals"
-- Replace "rows" with "items", "products", "orders", etc. (be specific)
-- Focus on business terms: revenue, sales, customers, products (not tables/columns)
-- Use active voice: "Sales increased" not "An increase in sales was observed"
-</instructions>
-
-<examples>
-  <example>
-    <input>
-      Data: Top 10 products by price
-      Results: 10 products, prices ranging from $1,200 to $2,499, all from "Mountain Bikes" category
-    </input>
-    <output>The analysis shows the 10 highest-priced products in the catalog. The most expensive item costs **$2,499**, while prices range from $1,200 to $2,499. Notably, all top products belong to the **Mountain Bikes** category.</output>
-  </example>
-
-  <example>
-    <input>
-      Data: Total orders by month for 2024
-      Results: 12 months, total of 4,523 orders, peak in December (612 orders), lowest in January (201 orders)
-    </input>
-    <output>The business processed **4,523 orders** throughout 2024. Order volume peaked in **December with 612 orders**, while January had the lowest activity at 201 orders. This shows strong seasonal variation with higher demand in the final quarter.</output>
-  </example>
-
-  <example>
-    <input>
-      Data: Revenue by product category
-      Results: 5 categories, Bikes ($245,000), Accessories ($89,000), Clothing ($45,000), Components ($67,000), Other ($12,000)
-    </input>
-    <output>**Bikes** dominate revenue at $245,000, representing more than half of total sales. Accessories and Components contribute $89,000 and $67,000 respectively, while Clothing and Other categories generate smaller amounts.</output>
-  </example>
-
-  <example>
-    <input>
-      Data: Customers who purchased in the last 30 days
-      Results: Empty dataset (0 rows)
-    </input>
-    <output>No customers made purchases in the last 30 days. This indicates a significant drop in recent sales activity that may require immediate attention.</output>
-  </example>
-</examples>
-    """,
-    output_key="explanation_text"
+""",
+    tools=[get_trend_daten_fuer_keywords],
+    output_key="trend_daten",
 )
 
-# Sequential Agent: Visualization → Explanation
-# These agents work together on the query results
+
+# ============================================================================
+# 4) Auswahl + Bewertung + SEO-Texte (Top 10)
+# ============================================================================
+seo_bewertung_agent = LlmAgent(
+    model=GEMINI_MODEL,
+    name="seo_bewertung_agent",
+    description="Wählt Top 10 Keywords aus, bewertet sie und erzeugt SEO-Texte.",
+    instruction="""
+<system_prompt>
+
+Du bist SEO-Redakteur und Keyword-Analyst.
+
+Inputs:
+{validierte_eingabe}
+{trend_daten}
+
+Aufgaben:
+1) Wähle exakt 10 Keywords aus den 30 angereicherten Keywords.
+2) Vergib pro Keyword einen gesamt_score (0-100):
+   - Themenrelevanz (0-50)
+   - Alters-Passung (0-20)
+   - Trendstärke (0-30, NUR wenn trends_verfuegbar=true, sonst 0)
+3) auswahl_begruendung: 1 Satz je Keyword.
+4) Erstelle folgende Textausgaben (deutsch):
+   - seo_titel (ca. 55-60 Zeichen)
+   - meta_beschreibung (ca. 150-160 Zeichen)
+   - hook_ueberschrift (kurz, prägnant, nicht reißerisch)
+   - vorspann (2-4 Sätze, neutral-professionell)
+
+Brand-Safety:
+- Keine sensiblen/illegalen Inhalte, keine anstößigen Formulierungen.
+
+Output (NUR JSON):
+{
+  "top_keywords": [
+    {
+      "keyword": "...",
+      "gesamt_score": 0-100,
+      "trend_index": int|null,
+      "suchvolumen": int|null,
+      "suchintention": "informativ|kommerziell|transaktional|navigational",
+      "auswahl_begruendung": "..."
+    }
+  ],
+  "seo_titel": "...",
+  "meta_beschreibung": "...",
+  "hook_ueberschrift": "...",
+  "vorspann": "...",
+  "trends_verfuegbar": true|false
+}
+
+Constraints:
+- Genau 10 Einträge in top_keywords.
+
+</system_prompt>
+""",
+    output_key="seo_ergebnis",
+)
+
+
+# ============================================================================
+# 5) Visualisierung (Altair Code)
+# ============================================================================
+visualisierungs_agent = LlmAgent(
+    model=GEMINI_MODEL,
+    name="visualisierungs_agent",
+    description="Erstellt ein Altair-Diagramm (Python-Code) für Keyword-Scores.",
+    instruction="""
+<system_prompt>
+
+Input:
+{seo_ergebnis}
+
+Erzeuge exakt EIN Altair-Diagramm als ausführbaren Python-Code.
+
+Ziel:
+- Horizontales Balkendiagramm: Keyword vs. gesamt_score
+- Sortiert nach gesamt_score absteigend
+
+HARD CONSTRAINTS:
+- Output NUR Python-Code
+- Keine Markdown-Fences
+- Muss enthalten:
+  - import altair as alt
+  - import pandas as pd
+- Das finale Chart muss in einer Variable 'chart' gespeichert sein
+- width 400-600, height 300-400
+
+Tooltips:
+- keyword, gesamt_score
+- optional trend_index, suchvolumen (wenn vorhanden)
+
+</system_prompt>
+""",
+    output_key="diagramm_code",
+)
+
+
+# ============================================================================
+# 6) Zusammenfassung (2-4 Sätze)
+# ============================================================================
+zusammenfassung_agent = LlmAgent(
+    model=GEMINI_MODEL,
+    name="zusammenfassung_agent",
+    description="Erstellt eine kurze Zusammenfassung der Ergebnisse (2-4 Sätze).",
+    instruction="""
+<system_prompt>
+
+Input:
+{seo_ergebnis}
+
+Schreibe exakt 2 bis 4 Sätze auf Deutsch:
+- Was zeigen die Top-Keywords inhaltlich?
+- Wie hat der Altersbereich die Auswahl beeinflusst?
+- Nenne mindestens eine konkrete Zahl (z. B. höchster gesamt_score).
+- Wenn trends_verfuegbar=false, erwähne das in 1 Satz (insgesamt 2-4 Sätze).
+
+Keine technischen Begriffe, kein SQL, kein Tool-Jargon.
+
+Output NUR Text.
+
+</system_prompt>
+""",
+    output_key="zusammenfassung",
+)
+
+
+# ============================================================================
+# Insight Pipeline: Visualisierung → Zusammenfassung
+# ============================================================================
 insight_pipeline = SequentialAgent(
-    name='insight_pipeline',
-    sub_agents=[visualization_agent, explanation_agent],
-    description="Generates visualization and explanation from query results"
-)
-
-# Runner for the insight pipeline
-insight_runner = InMemoryRunner(agent=insight_pipeline, app_name='insights')
-
-
-# ============================================================================
-# Agent 2: SQL Executor
-# ============================================================================
-
-sql_executor_agent = LlmAgent(
-    model=GEMINI_MODEL,
-    name='sql_executor_agent',
-    description="Executes SQL queries against the database and returns results.",
-    instruction="""
-<system_prompt>
-
-## Context
-You are a SQL execution agent in a Business Intelligence pipeline.
-You receive SQL queries from the text-to-SQL agent and execute them against the database.
-
-## Objective
-Your goal is to execute the provided SQL query and return the results in a structured format.
-Success is defined by: (1) successfully executing valid SQL, (2) returning data in JSON format, (3) handling errors gracefully.
-
-## Mode
-Act as a Database Execution Engine.
-You take SQL queries as input and return query results.
-
-## Attitude
-Be reliable and efficient.
-Always use the execute_sql_and_format tool to run queries.
-Return results exactly as provided by the tool.
-
-## Specifications
-HARD CONSTRAINTS:
-1. ALWAYS use the execute_sql_and_format tool to execute queries
-2. The SQL query is provided in the state variable: {sql_query}
-3. Return the tool's output directly without modification
-4. Do NOT try to execute queries without the tool
-
-</system_prompt>
-
-<instructions>
-1. Retrieve the SQL query from state: {sql_query}
-2. Use the execute_sql_and_format tool to execute it
-3. Return the tool's response (JSON with success, data, columns, row_count)
-</instructions>
-    """,
-    tools=[execute_sql_and_format],
-    output_key="query_results"
+    name="insight_pipeline",
+    sub_agents=[visualisierungs_agent, zusammenfassung_agent],
+    description="Erzeugt Diagramm-Code und Kurz-Zusammenfassung.",
 )
 
 
 # ============================================================================
-# Agent 3: Data Formatter for Visualization
+# Root Agent
 # ============================================================================
-
-data_formatter_agent = LlmAgent(
-    model=GEMINI_MODEL,
-    name='data_formatter_agent',
-    description="Formats query results for visualization and explanation agents.",
-    instruction="""
-<system_prompt>
-
-## Context
-You are a data formatting agent in the BI pipeline.
-You receive query results in JSON format and prepare them for the visualization and explanation agents.
-
-## Objective
-Extract and format the data from query results so downstream agents can work with it effectively.
-
-## Instructions
-1. Parse the query results from: {query_results}
-2. Extract the 'data' field (list of dictionaries)
-3. Format it as a clear, readable JSON structure
-4. Include information about:
-   - Number of rows returned
-   - Column names
-   - Sample data (first 10 rows if many)
-
-Output format:
-```
-Data Results: [row count] rows returned
-
-Columns: [column names]
-
-Data (as JSON):
-[formatted data]
-```
-
-</system_prompt>
-    """,
-    output_key="formatted_data"
-)
-
-
-# ============================================================================
-# Root Agent: Complete BI Pipeline (SequentialAgent)
-# ============================================================================
-
 root_agent = SequentialAgent(
-    name='root_agent',
-    description="Complete BI pipeline: natural language → SQL → execution → visualization → explanation",
+    name="keyword_pipeline",
+    description="Prüfung → Keywords → Trends → Bewertung+SEO → Diagramm → Zusammenfassung",
     sub_agents=[
-        text_to_sql_agent,      # Step 1: Generate SQL from question
-        sql_executor_agent,      # Step 2: Execute SQL and get results
-        data_formatter_agent,    # Step 3: Format data for downstream agents
-        insight_pipeline         # Step 4: Visualize and explain (Sequential: viz → explanation)
-    ]
+        eingabe_pruefung_agent,
+        keyword_generierung_agent,
+        trend_anreicherung_agent,
+        seo_bewertung_agent,
+        insight_pipeline,
+    ],
 )
 
-# Runner for the root agent
-root_runner = InMemoryRunner(agent=root_agent, app_name='bi_agent')
+
+# ============================================================================
+# Runner
+# ============================================================================
+root_runner = InMemoryRunner(agent=root_agent, app_name="keyword_agent")

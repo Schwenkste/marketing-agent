@@ -1,204 +1,188 @@
 """
-Tools for the Business Intelligence agents.
+Tools für den Keyword Agent.
 
-This module defines tools that agents can call to interact with the database,
-execute queries, and process results.
+Enthält:
+- Google Trends Abfrage (via pytrends) als Tool für Google ADK
+- Fallback, wenn Trends nicht verfügbar ist
+- Kleine Hilfsfunktionen (Normalisierung, Sicherheit)
+
+WICHTIG:
+pytrends liefert typischerweise KEIN echtes "Suchvolumen" (MSV).
+Wir geben daher:
+- trend_index (0-100 Proxy/Index)
+- suchvolumen = None
+- verwandte_suchanfragen (related queries)
 """
 
-import os
-import json
-import pandas as pd
-from typing import Dict, Any
-from dotenv import load_dotenv
-from .db_config import create_db_engine, get_schema_info
-from .sql_executor import execute_query, validate_sql
+from __future__ import annotations
 
-# Load environment variables
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
+from typing import Dict, List, Any, Optional
+import re
 
 
-class DatabaseTools:
-    """Tools for database operations that agents can use."""
-
-    def __init__(self, server: str, database: str, username: str, password: str):
-        """
-        Initialize database tools with connection credentials.
-
-        Args:
-            server: SQL Server hostname
-            database: Database name
-            username: Database username
-            password: Database password
-        """
-        self.engine = create_db_engine(server, database, username, password)
-
-    def execute_sql_query(self, sql_query: str) -> Dict[str, Any]:
-        """
-        Execute a SQL query and return the results.
-
-        This tool validates and executes SQL queries against the database.
-        Only SELECT queries are allowed for safety.
-
-        Args:
-            sql_query: The SQL query to execute
-
-        Returns:
-            Dictionary containing:
-                - success: Boolean indicating if query succeeded
-                - data: List of dictionaries with query results
-                - columns: List of column names
-                - row_count: Number of rows returned
-                - error: Error message if query failed
-        """
-        # Validate and execute the query
-        result = execute_query(self.engine, sql_query)
-
-        if result['success']:
-            # Convert DataFrame to list of dicts for JSON serialization
-            df = result['data']
-            data_list = df.to_dict(orient='records') if df is not None else []
-
-            return {
-                'success': True,
-                'data': data_list,
-                'columns': result['columns'],
-                'row_count': result['row_count'],
-                'error': None
-            }
-        else:
-            return {
-                'success': False,
-                'data': [],
-                'columns': [],
-                'row_count': 0,
-                'error': result['error']
-            }
+# -----------------------------
+# Kleine Utilities
+# -----------------------------
+def _normalisiere_keyword(keyword: str) -> str:
+    keyword = (keyword or "").strip()
+    keyword = re.sub(r"\s+", " ", keyword)
+    return keyword
 
 
-def execute_sql_and_format(sql_query: str) -> str:
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+
+# Optional: sehr grober Brand-Safety Filter (nur als zusätzliche Sicherung)
+# (Der eigentliche Brand-Safety-Check sollte in den Agenten-Instructions passieren.)
+_VERBOTENE_MUSTER = [
+    r"\b(kokain|heroin|meth|crystal|drogen kaufen)\b",
+    r"\b(waffe kaufen|schusswaffe|bombenbau)\b",
+    r"\b(kindesmissbrauch)\b",
+]
+
+
+def brand_safety_ok(keyword: str) -> bool:
+    k = keyword.lower()
+    for pat in _VERBOTENE_MUSTER:
+        if re.search(pat, k):
+            return False
+    return True
+
+
+# -----------------------------
+# Google Trends Tool (pytrends)
+# -----------------------------
+def get_trend_daten_fuer_keywords(
+    keywords: List[str],
+    land: str = "DE",
+    zeitraum: str = "today 12-m",
+    sprache: str = "de-DE",
+    max_verwandte: int = 5,
+) -> Dict[str, Any]:
     """
-    Execute a SQL query against the configured database and return formatted results.
-
-    This tool:
-    1. Connects to the database using credentials from environment variables
-    2. Executes the provided SQL query (SELECT only for safety)
-    3. Returns results as formatted JSON string with data and metadata
+    ADK Tool: Holt Trenddaten (Proxy-Index) und verwandte Suchanfragen.
 
     Args:
-        sql_query: The SQL SELECT query to execute
+        keywords: Liste von Keywords (Strings)
+        land: Geo (DE)
+        zeitraum: z.B. "today 12-m", "today 3-m", "today 5-y"
+        sprache: z.B. "de-DE"
+        max_verwandte: wie viele related queries max.
 
     Returns:
-        JSON string containing:
-            - success: Whether query succeeded
-            - data: Query results as list of dictionaries
-            - columns: Column names
-            - row_count: Number of rows
-            - error: Error message if failed
-
-    Example:
-        >>> result = execute_sql_and_format("SELECT TOP 5 * FROM Products")
-        >>> print(result)
-        {"success": true, "data": [...], "row_count": 5}
+        {
+          "trends_verfuegbar": bool,
+          "ergebnisse": [
+             {
+               "keyword": str,
+               "trend_index": int|None,  # 0-100 Proxy
+               "suchvolumen": None,      # pytrends liefert i.d.R. kein MSV
+               "verwandte_suchanfragen": [str, ...]
+             }, ...
+          ],
+          "hinweis": str
+        }
     """
+    # Normalisieren + Brand safety + Dedup
+    cleaned = [_normalisiere_keyword(k) for k in (keywords or [])]
+    cleaned = [k for k in cleaned if k and brand_safety_ok(k)]
+    cleaned = _dedupe_preserve_order(cleaned)
+
+    if not cleaned:
+        return {
+            "trends_verfuegbar": False,
+            "ergebnisse": [],
+            "hinweis": "Keine gültigen Keywords für Trends-Abfrage vorhanden.",
+        }
+
+    # pytrends kann pro Request nur eine begrenzte Anzahl Keywords sinnvoll handeln.
+    # Wir machen es robust: batchweise und aggregieren.
     try:
-        # Get database credentials from environment
-        server = os.getenv("MSSQL_SERVER")
-        database = os.getenv("MSSQL_DATABASE")
-        username = os.getenv("MSSQL_USERNAME")
-        password = os.getenv("MSSQL_PASSWORD")
+        from pytrends.request import TrendReq  # type: ignore
+        import pandas as pd  # noqa: F401
 
-        if not all([server, database, username, password]):
-            return json.dumps({
-                'success': False,
-                'data': [],
-                'columns': [],
-                'row_count': 0,
-                'error': 'Database credentials not configured in environment variables'
-            })
+        pytrends = TrendReq(hl=sprache, tz=360)
 
-        # Create database engine
-        engine = create_db_engine(server, database, username, password)
+        ergebnisse: List[Dict[str, Any]] = []
 
-        # Execute query
-        result = execute_query(engine, sql_query)
+        # Batch-Größe: 5 ist erfahrungsgemäß stabil
+        BATCH_SIZE = 5
+        for i in range(0, len(cleaned), BATCH_SIZE):
+            batch = cleaned[i : i + BATCH_SIZE]
+            pytrends.build_payload(batch, timeframe=zeitraum, geo=land)
 
-        if result['success']:
-            # Convert DataFrame to list of dicts for JSON serialization
-            df = result['data']
-            data_list = df.to_dict(orient='records') if df is not None and not df.empty else []
+            # 1) Interest over time -> wir reduzieren auf einen Proxy-Index:
+            #    z.B. Maximum über Zeitraum oder Mittelwert (hier: Mittelwert).
+            iot = pytrends.interest_over_time()
+            # iot enthält Spalten je Keyword + evtl. isPartial
 
-            response = {
-                'success': True,
-                'data': data_list,
-                'columns': result['columns'],
-                'row_count': result['row_count'],
-                'error': None
-            }
-        else:
-            response = {
-                'success': False,
-                'data': [],
-                'columns': [],
-                'row_count': 0,
-                'error': result['error']
-            }
+            # 2) Related queries
+            related = pytrends.related_queries()  # dict: {keyword: {"top": df, "rising": df}}
 
-        # Close engine
-        engine.dispose()
+            for kw in batch:
+                trend_index: Optional[int] = None
+                try:
+                    if kw in iot.columns:
+                        series = iot[kw].dropna()
+                        if len(series) > 0:
+                            # Proxy: Durchschnitt (0-100)
+                            trend_index = int(round(float(series.mean())))
+                except Exception:
+                    trend_index = None
 
-        return json.dumps(response, indent=2)
+                verwandte: List[str] = []
+                try:
+                    rq = related.get(kw, {})
+                    top_df = rq.get("top")
+                    rising_df = rq.get("rising")
+
+                    # Wir nehmen zuerst rising, dann top (oder andersrum).
+                    if rising_df is not None and not rising_df.empty:
+                        verwandte += rising_df["query"].head(max_verwandte).tolist()
+                    if top_df is not None and not top_df.empty and len(verwandte) < max_verwandte:
+                        needed = max_verwandte - len(verwandte)
+                        verwandte += top_df["query"].head(needed).tolist()
+
+                    verwandte = [_normalisiere_keyword(x) for x in verwandte if isinstance(x, str)]
+                    verwandte = [x for x in verwandte if x and brand_safety_ok(x)]
+                    verwandte = _dedupe_preserve_order(verwandte)
+                except Exception:
+                    verwandte = []
+
+                ergebnisse.append(
+                    {
+                        "keyword": kw,
+                        "trend_index": trend_index,
+                        "suchvolumen": None,
+                        "verwandte_suchanfragen": verwandte,
+                    }
+                )
+
+        return {
+            "trends_verfuegbar": True,
+            "ergebnisse": ergebnisse,
+            "hinweis": "trend_index ist ein Proxy (0-100) aus Google Trends; echtes Suchvolumen ist hier nicht enthalten.",
+        }
 
     except Exception as e:
-        return json.dumps({
-            'success': False,
-            'data': [],
-            'columns': [],
-            'row_count': 0,
-            'error': f'Tool error: {str(e)}'
-        })
-
-
-def get_database_schema() -> str:
-    """
-    Retrieve database schema information for SQL query generation.
-
-    Returns formatted schema showing available tables and columns that can be
-    queried. This helps the text-to-SQL agent understand the database structure.
-
-    Returns:
-        Formatted string containing database schema information
-
-    Example:
-        >>> schema = get_database_schema()
-        >>> print(schema)
-        Database Schema:
-
-        Table: dbo.Products
-        Columns:
-          - ProductID (int, NOT NULL)
-          - ProductName (nvarchar, NOT NULL)
-          ...
-    """
-    try:
-        # Get database credentials from environment
-        server = os.getenv("MSSQL_SERVER")
-        database = os.getenv("MSSQL_DATABASE")
-        username = os.getenv("MSSQL_USERNAME")
-        password = os.getenv("MSSQL_PASSWORD")
-
-        if not all([server, database, username, password]):
-            return "Error: Database credentials not configured in environment variables"
-
-        # Create database engine
-        engine = create_db_engine(server, database, username, password)
-
-        # Get schema info
-        schema_info = get_schema_info(engine, max_tables=20)
-
-        # Close engine
-        engine.dispose()
-
-        return schema_info
-
-    except Exception as e:
-        return f"Error retrieving schema: {str(e)}"
+        # Fallback ohne Trends
+        return {
+            "trends_verfuegbar": False,
+            "ergebnisse": [
+                {
+                    "keyword": k,
+                    "trend_index": None,
+                    "suchvolumen": None,
+                    "verwandte_suchanfragen": [],
+                }
+                for k in cleaned
+            ],
+            "hinweis": f"Trends-Abfrage nicht verfügbar (pytrends Fehler): {str(e)}",
+        }
